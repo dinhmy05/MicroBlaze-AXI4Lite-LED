@@ -1,0 +1,467 @@
+================================================================================
+01. TỔNG QUAN
+================================================================================
+Mục tiêu: xây dựng hệ thống xử lý nhúng MicroBlaze, điều khiển LED 4 bit thông qua thiết bị ngoại vi memory-mapped AXI4-Lite. Phần mềm C do MicroBlaze thực thi điều khiển thanh ghi, logic FPGA đổi sang trạng thái LED. Mục tiêu kiểm chứng: chạy firmware trong mô phỏng RTL, quan sát led_out và các tín hiệu bus.
+
+Phân tầng:
+  Firmware C -> GNU MicroBlaze compiler (Trình biên dịch tích hợp trong vitis) -> Tạo file ELF -> nạp vào bộ nhớ lệnh MicroBlaze
+  MicroBlaze -> AXI SmartConnect -> AXI4-Lite Slave -> LED Register Bridge -> LED Controller -> led_out[3:0]
+  Clock Wizard + Processor System Reset cung cấp clock và reset đồng bộ.
+
+Phần cứng là các module Verilog/ IP cấu trúc logic. Phần mềm C không tự biến thành mạch LED: C được dịch sang mã máy chạy trên lõi MicroBlaze; lệnh ghi/đọc địa chỉ tạo giao dịch bus đi qua các tầng phần cứng.
+
+--------------------------------------------------------------------------------
+Firmware C					Quy định MicroBlaze phải ghi/đọc dữ liệu gì và điều khiển LED theo trình tự nào
+-						-
+GNU MicroBlaze Compiler				Dịch chương trình C thành mã máy phù hợp với tập lệnh MicroBlaze
+-						-
+ELF						Chứa chương trình đã biên dịch, cùng thông tin để đưa chương trình vào bộ nhớ
+-						-
+BRAM						Lưu chương trình và dữ liệu để MicroBlaze truy cập
+-						-
+MicroBlaze					CPU thực thi các lệnh máy và tạo các yêu cầu truy cập bộ nhớ/ngoại vi
+-						-
+AXI SmartConnect				Kết nối và định tuyến giao dịch AXI từ CPU đến đúng ngoại vi
+-						-
+AXI4-Lite Slave					Nhận giao dịch đọc/ghi theo giao thức AXI4-Lite
+-						-
+LED Register Bridge				Chuyển yêu cầu đọc/ghi từ AXI Slave thành thao tác trên các thanh ghi LED
+-						-
+LED Controller					Xử lý enable, blink mode và dữ liệu LED để tạo đầu ra
+-						-
+Clock Wizard					Tạo clock phù hợp để hệ thống hoạt động đồng bộ (Bộ nhân tần số)
+-						-
+Processor System Reset				Quản lý tín hiệu reset cho CPU và các ngoại vi
+--------------------------------------------------------------------------------
+
+================================================================================
+02. KHỞI TẠO PROJECT VIVADO VÀ MICROBlAZE
+================================================================================
+
+tạo RTL Project và chọn part xc7z020clg484-1 của ZedBoard. 
+Tạo Block Design (BD) tên Microblaze_Controller.
+
+Add IP 'MicroBlaze'. Chạy Run Block Automation để cấu hình processor, local memory và Debug Module. Trong BD thực tế có microblaze_0, microblaze_0_local_memory, mdm_1 .
+
+Local memory gồm DLMB/ILMB, các LMB bus, controller và lmb_bram. Instruction LMB Bus chuyên dùng để CPU lấy mã lệnh từ bộ nhớ (Instruction Fetch); Data LMB Bus phục vụ CPU đọc/ghi dữ liệu trong bộ nhớ cục bộ (Data Access).
+
+MDM (MicroBlaze Debug Module) nối interface DEBUG của MicroBlaze; tín hiệu Debug_SYS_Rst đi vào Processor System Reset. Đây là đường yêu cầu reset từ debug, không phải bus dữ liệu LED.
+
+  - Block Automation: xây các khối phụ thuộc của subsystem MicroBlaze, tạo bộ nhớ, debug theo lựa chọn.
+  - Connection Automation: tạo kết nối AXI/clock/reset cho IP, có thể bổ sung AXI SmartConnect.
+
+Add IP AXI SmartConnect
+
+================================================================================
+03. IMPORT IP AXI4-LITE MÃ NGUỒN MỞ
+================================================================================
+Repo: https://github.com/suoglu/AXI-lite-slave 
+
+Tải GitHub -> Code -> Download ZIP, giải nén đường dẫn ngắn. Dùng thư mục Sources/ip_repo/axi_lite_slave_1.0 bao gồm component.xml, hdl/, bd/, drivers/, xgui/.
+
+Trong Vivado:   Tools/Settings (hoặc Project Settings) -> IP -> Repository -> Add thư mục Sources/ip_repo -> Apply. 
+		Block Design -> Add IP -> AXI4-Lite Slave.
+
+Thêm led_reg_bridge. Không được coi một IP mã nguồn mở chưa verification đầy đủ là IP đã được chứng nhận AXI compliance.
+
+AXI4-Lite có 5 kênh độc lập:
+ AW = 	Master gửi địa chỉ cần ghi (AWADDR/AWVALID/AWREADY),
+ W =  	Master gửi dữ liệu cần ghi(WDATA/WSTRB/WVALID/WREADY),
+ B = 	Slave phản hồi kết quả ghi (BRESP/BVALID/BREADY),
+ AR = 	Master gửi địa chỉ cần đọc (ARADDR/ARVALID/ARREADY),
+ R = 	Slave trả dữ liệu và phản hồi đọc (RDATA/RRESP/RVALID/RREADY).
+
+ Một lần handshake xảy ra tại cạnh clock có VALID=1 và READY=1. AW/W có thể đến khác chu kỳ. Master phải xử lý phản hồi B/R để giao dịch hoàn tất.
+--------------------------------------------------------------------------------
+VALID: Bên gửi đang đưa thông tin hợp lệ lên bus.
+READY: Bên nhận sẵn sàng tiếp nhận thông tin.
+--------------------------------------------------------------------------------
+Port giao diện GP trong RTL thực tế: (Tín hiệu để phân tích Wareferm xác nhận xem giao tiếp cso hoạt động đúng hay không)
+  write 				Output		Báo có yêu cầu ghi
+  write_addrs				Output		Địa chỉ offset cần ghi
+  write_data[31:0] 			Output		Dữ liệu cần ghi
+  write_strobe[3:0] 			Output		Xác định những byte được phép ghi
+  write_done 				Input		Register Bridge báo xử lý ghi hoàn tất
+  write_error				Input		Báo lỗi khi ghi
+  read					Output		Báo có yêu cầu đọc
+  read_addrs				Output		Địa chỉ offset cần đọc
+  input read_data[31:0]			Input		Dữ liệu thanh ghi trả về
+  read_done				Input		Báo dữ liệu đọc hợp lệ
+  read_error				Input		Báo lỗi khi đọc
+--------------------------------------------------------------------------------
+================================================================================
+04. THIẾT KẾ HAI MODULE RTL PHÍA LED
+================================================================================
+Mục tiêu: Thiết kế hai module Verilog để nhận yêu cầu đọc/ghi từ AXI4-Lite Slave, lưu dữ liệu vào thanh ghi và điều khiển 4 LED.
+
+Gồm 2 module:
+  - led_reg_bridge.v : Xử lý thanh ghi và giao tiếp với AXI4-Lite Slave.
+  - led_controller.v : Nhận dữ liệu điều khiển và tạo tín hiệu LED.
+Luồng hoạt động:
+  AXI4-Lite Slave -> LED Register Bridge -> LED Controller -> led_out[3:0]
+
+--------------------------------------------------------------------------------
+Module led_controller.v 
+- Điều khiển trạng thái 4 LED dựa trên dữ liệu, tín hiệu cho phép (enable) và chế độ nhấp nháy (blink_mode)
+  clk                 Input        Clock điều khiển hoạt động của module
+  resetn              Input        Reset Active Low (0: Reset, 1: Hoạt động)
+  enable              Input        Cho phép bật/tắt LED
+  blink_mode          Input        Chọn chế độ LED thường hoặc nhấp nháy
+  led_data[3:0]       Input        Dữ liệu 4 bit quy định trạng thái LED
+  led[3:0]            Output       Tín hiệu xuất ra 4 LED
+
+--------------------------------------------------------------------------------
+Module led_reg_bridge.v 
+- Là cầu nối giữa AXI4-Lite Slave và LED Controller. Module nhận yêu cầu đọc/ghi, giải mã địa chỉ, lưu giá trị thanh ghi và xuất các tín hiệu điều khiển LED.  
+
+Các tín hiệu nhận từ AXI4-Lite Slave:
+
+  write               Input       Báo có yêu cầu ghi thanh ghi
+  write_addrs[5:0]    Input       Địa chỉ offset cần ghi
+  write_data[31:0]    Input       Dữ liệu ghi vào thanh ghi
+  write_strobe[3:0]   Input       Xác định byte dữ liệu được phép ghi
+
+  read                Input       Báo có yêu cầu đọc thanh ghi
+  read_addrs[5:0]     Input       Địa chỉ offset cần đọc
+
+Các tín hiệu trả về AXI4-Lite Slave:
+
+  write_done          Output      Báo yêu cầu ghi hoàn tất
+  write_error         Output      Báo lỗi ghi
+  read_data[31:0]     Output      Trả dữ liệu đọc từ thanh ghi
+  read_done           Output      Báo dữ liệu đọc hợp lệ
+  read_error          Output      Báo lỗi đọc
+
+Các tín hiệu chung:
+
+  clk                 Input       Clock đồng bộ
+  resetn              Input       Reset Active Low
+
+Các tín hiệu xuất sang LED Controller:
+
+  led_data[3:0]       Output      Dữ liệu điều khiển 4 LED
+  enable              Output      Cho phép LED hoạt động
+  blink_mode          Output      Chọn chế độ nhấp nháy
+--------------------------------------------------------------------------------
+REGISTER MAP (ÁNH XẠ THANH GHI)
+
+BASE ADDRESS = 0x44A00000
+
+  Offset     Thanh ghi       Chức năng
+  ----------------------------------------------------------------------
+  0x00       LED_DATA        RW - Lưu dữ liệu điều khiển LED
+  0x04       LED_CTRL        RW - Lưu enable và blink_mode
+
+LED_DATA:
+  bit [3:0]  -> led_data[3:0], quy định trạng thái 4 LED.
+
+LED_CTRL:
+  bit [0]    -> enable
+                 0 = Tắt LED
+                 1 = Cho phép LED hoạt động
+
+  bit [1]    -> blink_mode
+                 0 = Hiển thị LED theo dữ liệu
+                 1 = LED nhấp nháy
+--------------------------------------------------------------------------------
+NGUYÊN LÝ ĐỌC/GHI THANH GHI
+
+WRITE:
+  AXI4-Lite Slave phát write, write_addrs, write_data và write_strobe.
+  Khi write = 1 và write_strobe[0] = 1, Register Bridge ghi dữ liệu vào
+  thanh ghi tương ứng tại cạnh lên clock.
+
+READ:
+  AXI4-Lite Slave phát read và read_addrs.
+  Register Bridge dùng case combinational để chọn thanh ghi và trả read_data.
+
+Phản hồi trong RTL hiện tại:
+  write_done  = 1      Báo sẵn sàng hoàn tất yêu cầu ghi.
+  read_done   = 1      Báo dữ liệu đọc sẵn sàng.
+  write_error = 0      Không phát tín hiệu lỗi ghi.
+  read_error  = 0      Không phát tín hiệu lỗi đọc.
+--------------------------------------------------------------------------------
+VÍ DỤ HOẠT ĐỘNG TRONG PROJECT
+
+  LED_BASE = 0x44A00000
+  LED_DATA = LED_BASE + 0x00
+  LED_CTRL = LED_BASE + 0x04
+
+  Ghi LED_DATA = 0x05, LED_CTRL = 0x01  -> LED = 0101
+  Ghi LED_DATA = 0x0A                   -> LED = 1010
+  Ghi LED_CTRL = 0x00                   -> LED = 0000
+  Ghi LED_DATA = 0x0F, LED_CTRL = 0x01  -> LED = 1111
+
+Chuỗi LED mong đợi: 0101 -> 1010 -> 0000 -> 1111.
+
+--------------------------------------------------------------------------------
+AXI4-Lite Slave       Xử lý giao thức AXI: địa chỉ, dữ liệu và phản hồi.
+LED Register Bridge   Giải mã địa chỉ, lưu và đọc các thanh ghi điều khiển.
+LED Controller        Nhận giá trị thanh ghi để quyết định đầu ra LED.
+LED_DATA              Quy định trạng thái 4 LED.
+LED_CTRL              Điều khiển enable và blink_mode.
+write / read          Yêu cầu ghi / đọc từ AXI4-Lite Slave.
+write_done/read_done  Báo hoàn tất yêu cầu ghi / dữ liệu đọc hợp lệ.
+
+================================================================================
+05. KẾT NỐI BLOCK DESIGN (theo BlockDessign trong Vivado)
+================================================================================
+
+================================================================================
+06. CLOCK, RESET VÀ DEBUG LỖI ACTIVE-LOW
+================================================================================
+Clock Wizard 'clk_wiz_1': input single-ended 100MHz, clk_out1=100MHz; locked=1 biểu thị mạch tạo clock đã đạt trạng thái khóa. CLK_OUT1 cấp chung cho MicroBlaze, LMB, SmartConnect, AXI Slave, Bridge và LED Controller.
+
+'rst_clk_wiz_1_100M' là proc_sys_reset: đồng bộ hóa/reset theo trạng thái clock, nguồn external, auxiliary và debug. mb_reset tác động mức cao; peripheral_aresetn tác động mức thấp.
+
+Nguyên nhân lỗi : Chưa đồng bộ mức logic sẽ reset. (Reset mức 0 đảm bảo ổn định tín hiệu hơn)
+
+================================================================================
+07. ADDRESS EDITOR, BRAM VÀ LINKER SCRIPT
+================================================================================
+ục tiêu: Xác định vùng địa chỉ bộ nhớ và ngoại vi để MicroBlaze có thể
+thực thi chương trình, truy cập dữ liệu và điều khiển LED qua AXI4-Lite.
+
+Memory-mapped I/O:
+  CPU điều khiển ngoại vi bằng lệnh đọc/ghi tới địa chỉ được ánh xạ.
+  MicroBlaze không trực tiếp điều khiển chân LED mà ghi dữ liệu vào các
+  thanh ghi ngoại vi thông qua AXI SmartConnect và AXI4-Lite Slave.
+
+Address Editor:
+  Công cụ trong Vivado dùng để cấp phát vùng địa chỉ cho BRAM và AXI IP.
+
+  Local BRAM:
+    Base Address = 0x00000000
+    Range        = 16 KB (0x4000 byte)
+    Chức năng: Lưu chương trình và dữ liệu của MicroBlaze.
+
+  AXI4-Lite Slave:
+    Base Address = 0x44A00000
+    Range        = 64 KB
+    Chức năng: Vùng địa chỉ để CPU truy cập ngoại vi LED.
+
+  Lưu ý: 64 KB là vùng địa chỉ được cấp phát, không có nghĩa ngoại vi
+  chứa 64 KB bộ nhớ hay có 64 KB thanh ghi được triển khai.
+
+Register Map:
+  0x44A00000 -> LED_DATA -> Điều khiển trạng thái LED.
+  0x44A00004 -> LED_CTRL -> Điều khiển enable và blink_mode.
+
+--------------------------------------------------------------------------------
+BRAM (BLOCK RAM)
+--------------------------------------------------------------------------------
+
+  Bộ nhớ vật lý tích hợp bên trong FPGA, dùng để lưu mã lệnh và dữ liệu.
+
+  Dung lượng = 16 KB = 16.384 byte.
+  Vùng địa chỉ = 0x00000000 đến 0x00003FFF.
+
+  MicroBlaze truy cập BRAM qua ILMB (lấy lệnh) và DLMB (đọc/ghi dữ liệu).
+
+--------------------------------------------------------------------------------
+LINKER SCRIPT (lscript.ld)
+--------------------------------------------------------------------------------
+
+  File quy định cách bố trí các phần chương trình vào vùng bộ nhớ.
+  Được Vitis sử dụng khi liên kết chương trình C để tạo ELF.
+
+  ORIGIN     = 0x00000050  -> Địa chỉ đầu vùng linker sử dụng.
+  LENGTH     = 0x00003FB0  -> Kích thước vùng nhớ: 16.304 byte.
+  STACK_SIZE = 0x400       -> Dung lượng Stack: 1 KB.
+  HEAP_SIZE  = 0x800       -> Dung lượng Heap: 2 KB.
+
+Các thành phần bộ nhớ:
+
+  .text       Chứa mã lệnh máy của chương trình.
+  .rodata     Chứa hằng số và dữ liệu chỉ đọc.
+  .data       Chứa biến toàn cục/static có giá trị khởi tạo.
+  .bss        Chứa biến toàn cục/static khởi tạo bằng 0.
+  Stack       Chứa dữ liệu phục vụ lời gọi hàm và biến cục bộ.
+  Heap        Vùng cấp phát bộ nhớ động.
+
+--------------------------------------------------------------------------------
+MỐI LIÊN HỆ GIỮA ADDRESS EDITOR, BRAM VÀ LINKER SCRIPT
+--------------------------------------------------------------------------------
+
+  Address Editor -> Xác định địa chỉ các khối phần cứng.
+  BRAM           -> Bộ nhớ vật lý chứa chương trình và dữ liệu.
+  Linker Script  -> Quy định chương trình được bố trí ở đâu trong BRAM.
+  ELF            -> File chương trình đã biên dịch và liên kết cho CPU.
+
+  Vitis biên dịch C -> ELF -> Khởi tạo vào BRAM -> MicroBlaze thực thi
+  -> Truy cập thanh ghi LED qua AXI -> LED Controller xuất tín hiệu LED.
+
+Lưu ý:
+  - Địa chỉ trong Linker Script phải phù hợp với hệ thống bộ nhớ.
+  - Đổi kích thước BRAM hoặc memory map có thể cần cập nhật Linker Script.
+  - Không dùng kích thước file ELF trên ổ đĩa làm căn cứ duy nhất để
+    kết luận chương trình có vừa BRAM hay không.
+
+================================================================================
+08. XUẤT XSA, BUILD PLATFORM VÀ APPLICATION TRONG VITIS
+================================================================================
+Vivado: File > Export > Export Hardware;
+
+Vitis Unified IDE 2025.1: Set Workspace -> New Component > Platform; 
+				Hardware Design -> chọn XSA; OS=standalone, processor=microblaze_0; Finish -> Build Platform. 
+
+New Component > Application; chọn microblaze_led_platform, domain standalone_microblaze_0; tạo Empty Application, src/main.c; 
+
+Build bằng MicroBlaze GCC -> microblaze_led_test.elf 
+
+Khi sửa Block Design/địa chỉ/processor memory, phải export XSA mới, cập nhật/rebuild Platform rồi rebuild Application để firmware khớp.
+================================================================================
+09. FIRMWARE C – MỤC ĐÍCH VÀ TRÌNH TỰ
+================================================================================
+TẠI SAO PHẢI BUILD ELF? CPU MicroBlaze chỉ chạy instruction machine code, không trực tiếp chạy tệp .c. GCC/ linker tạo ELF và liên kết section vào địa chỉ bộ nhớ. Khi mô phỏng SoC thật, bộ nhớ BRAM phải được khởi tạo từ firmware; CPU fetch instruction, chạy chương trình, phát giao dịch AXI. Testbench RTL bên ngoài chỉ cấp clock/reset và monitor LED. Nếu thay CPU bằng AXI bus-function-model thì KHÔNG cần C/ELF, nhưng đó chỉ là kiểm thử subsystem AXI->LED, không kiểm thử CPU->LED.
+
+
+================================================================================
+10. ELF ASSOCIATION, TESTBENCH VÀ CÁCH CHẠY
+================================================================================
+
+Mục tiêu: Kiểm chứng toàn bộ hệ thống MicroBlaze thực thi firmware C,
+phát giao dịch AXI4-Lite và điều khiển LED đúng theo chương trình.
+
+Tại sao phải biên dịch C thành ELF?
+
+  - MicroBlaze là CPU, chỉ thực thi được mã máy, không hiểu trực tiếp C.
+  - GNU MicroBlaze GCC biên dịch mã C thành mã máy.
+  - Linker liên kết chương trình, tạo file ELF chứa mã lệnh và dữ liệu.
+  - Vivado dùng ELF để chuẩn bị nội dung khởi tạo BRAM trong mô phỏng.
+  - MicroBlaze đọc lệnh từ BRAM và thực thi để phát giao dịch AXI4-Lite.
+
+Tại sao phải Associate ELF trong Vivado?
+
+  - Vivado không tự lấy hoặc biên dịch main.c từ Vitis.
+  - Associate ELF chỉ định chương trình sẽ chạy trên MicroBlaze.
+  - Simulation Sources sử dụng microblaze_led_test.elf.
+  - Khi mô phỏng, BRAM được khởi tạo từ firmware đã liên kết.
+  - CPU thực thi chương trình, không phải Testbench thực thi code C.
+
+Vai trò của Testbench:
+
+  - Tạo clock 100 MHz và tín hiệu reset.
+  - Instantiate toàn bộ hệ thống MicroBlaze.
+  - Quan sát led_out[3:0] trong quá trình CPU thực thi firmware.
+  - So sánh trạng thái LED thực tế với giá trị mong đợi.
+  - Báo PASS nếu đúng, FAIL nếu sai hoặc timeout.
+
+Luồng kiểm chứng:
+
+  main.c -> MicroBlaze GCC + Linker -> ELF -> BRAM
+         -> MicroBlaze thực thi -> AXI4-Lite
+         -> LED Register Bridge -> LED Controller
+         -> Testbench quan sát LED -> PASS/FAIL.
+
+--------------------------------------------------------------------------------
+BƯỚC 1. BIÊN DỊCH CHƯƠNG TRÌNH C TRONG VITIS
+--------------------------------------------------------------------------------
+
+  - Mở Vitis Unified IDE
+  - Mở Application Component: microblaze_led_test.
+  - Kiểm tra file main.c và lscript.ld.
+  - Nhấn Build Application.
+  - Nếu Build thành công -> tạo microblaze_led_test.elf.
+
+Mục đích: Chuyển chương trình C thành mã máy cho MicroBlaze thực thi.
+
+Lưu ý: Nếu đã có ELF và không thay đổi chương trình C, cấu hình bộ nhớ hoặc Address Map, không cần Build lại.
+
+--------------------------------------------------------------------------------
+BƯỚC 2. ASSOCIATE ELF FILE TRONG VIVADO
+--------------------------------------------------------------------------------
+  - Mở project Vivado 
+  - Chọn Tools -> Associate ELF Files.
+  - Trong mục Simulation Sources:
+      Processor: microblaze_0
+      ELF File : microblaze_led_test.elf
+  - Nhấn OK.
+
+Mục đích: Chỉ định firmware dùng để khởi tạo BRAM khi mô phỏng.
+
+Lưu ý: Design Sources có thể tiếp tục sử dụng mb_bootloop_le.elf nếu mục tiêu hiện tại chỉ là Behavioral Simulation.
+
+--------------------------------------------------------------------------------
+BƯỚC 3. THÊM TESTBENCH VÀO SIMULATION SOURCES
+--------------------------------------------------------------------------------
+  - Chọn Flow Navigator -> Add Sources.
+  - Chọn Add or Create Simulation Sources -> Next.
+  - Nhấn Add Files.
+  - Chọn file tb_microblaze_led_system.v.
+  - Nhấn Finish.
+
+Trong Sources -> Simulation Sources:
+  - Nhấp chuột phải tb_microblaze_led_system.
+  - Chọn Set as Top.
+
+Mục đích: Xác định module kiểm thử làm top của mô phỏng.
+
+Lưu ý:
+  Design Sources top     = Microblaze_Controller_wrapper.
+  Simulation Sources top = tb_microblaze_led_system.
+
+Nếu Testbench đã nằm trong Simulation Sources thì không cần Add lại.
+
+--------------------------------------------------------------------------------
+BƯỚC 4. CHẠY BEHAVIORAL SIMULATION
+--------------------------------------------------------------------------------
+
+  - Trong Flow Navigator chọn Run Simulation.
+  - Chọn Run Behavioral Simulation.
+  - Vivado biên dịch HDL và khởi tạo môi trường mô phỏng XSim.
+  - Nếu mô phỏng đã mở từ trước, chọn Restart để chạy lại từ đầu.
+  - Nhấn Run All để chạy đến khi Testbench kết thúc hoặc báo lỗi.
+
+Mục đích: Mô phỏng toàn bộ hệ thống MicroBlaze và các IP.
+
+--------------------------------------------------------------------------------
+BƯỚC 5. KIỂM TRA WAVEFORM VÀ TCL CONSOLE
+--------------------------------------------------------------------------------
+Trong Waveform, kiểm tra:
+
+  sys_clock             Clock hoạt động ở 100 MHz.
+  sys_reset_n           Ban đầu = 0, sau 2000 ns = 1.
+  mb_reset              Về 0 sau khi hệ thống thoát reset.
+  peripheral_aresetn    Lên 1 sau khi reset được giải phóng.
+  led_out[3:0]          Trạng thái LED đầu ra.
+
+Chuỗi LED mong đợi:
+
+  0101 -> 1010 -> 0000 -> 1111
+
+Trong Tcl Console, kiểm tra thông báo từ Testbench:
+
+  [PASS] TEST 1: LED 0101
+  [PASS] TEST 2: LED 1010
+  [PASS] TEST 3: LED OFF
+  [PASS] TEST 4: LED 1111
+
+  END-TO-END TEST PASSED
+
+--------------------------------------------------------------------------------
+BƯỚC 6. KIỂM TRA GIAO TIẾP AXI4-LITE
+--------------------------------------------------------------------------------
+Trong cửa sổ Simulation:
+
+  - Mở Scopes.
+  - Tìm instance axi_lite_slave_0.
+  - Chọn các tín hiệu cần kiểm tra trong Objects.
+  - Nhấp chuột phải -> Add to Wave Window.
+  - Restart -> Run All để thu thập lại waveform.
+
+Các tín hiệu quan trọng:
+
+  AWVALID / AWREADY      Xác nhận tiếp nhận địa chỉ ghi.
+  WVALID  / WREADY       Xác nhận tiếp nhận dữ liệu ghi.
+  BVALID  / BREADY       Xác nhận tiếp nhận phản hồi ghi.
+  BRESP                   Kiểm tra trạng thái giao dịch ghi.
+  ARVALID / ARREADY      Xác nhận tiếp nhận địa chỉ đọc.
+  RVALID  / RREADY       Xác nhận tiếp nhận dữ liệu đọc.
+  RDATA / RRESP           Dữ liệu và phản hồi đọc.
+
+Điều kiện:
+  VALID = 1 và READY = 1 tại cạnh lên clock -> Handshake hoàn tất.
+  BRESP = 00 -> Phản hồi ghi OKAY.
+  RRESP = 00 -> Phản hồi đọc OKAY.
+

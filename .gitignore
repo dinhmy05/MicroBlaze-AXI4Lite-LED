@@ -1,0 +1,21 @@
+# Generated Vivado / Vitis outputs
+.Xil/
+*.cache/
+*.runs/
+*.gen/
+*.sim/
+*.ip_user_files/
+*.hw/
+*.jou
+*.log
+*.wdb
+*.dcp
+*.pb
+build/
+Debug/
+Release/
+*.o
+# Keep the supplied ELF for simulation reproducibility
+# Hardware bitstreams are generated outputs
+*.bit
+*.ltx
