@@ -138,15 +138,6 @@ Các nguồn tham khảo sử dụng để tìm hiểu kiến trúc hệ thống
 4. **Yiğit Süoğlu**, *AXI-Lite Slave* (mã nguồn IP dùng trong project): <https://github.com/suoglu/AXI-lite-slave>.
 5. **AMD**, *Vivado Design Suite Tutorial: Creating and Packaging Custom IP* (UG1119, 2024.2): <https://docs.amd.com/r/2024.2-English/ug1119-vivado-creating-packaging-ip-tutorial> — quy trình đóng gói và tích hợp IP vào Vivado.
 
-## 8. Tài liệu chi tiết và ghi nhận đóng góp
-
-- Quy trình thiết kế và checklist mô phỏng: `docs/MicroBlaze_AXI4Lite_LED_ZedBoard_FullFlow_Report.txt`.
-- IP AXI-Lite Slave của Yiğit Süoğlu: <https://github.com/suoglu/AXI-lite-slave>.
-- Hai module ứng dụng của nhóm: `led_reg_bridge.v`, `led_controller.v`.
-
-**Lưu ý khi công khai source:** kiểm tra đường dẫn máy cá nhân trong `.xpr`, Tcl và các file cấu hình trước khi commit; không đưa các thư mục Vivado tự sinh (`.Xil/`, `*.cache/`, `*.runs/`, `*.gen/`, `*.sim/`) nếu không cần thiết.
-
-
 ## Lưu ý khi sử dụng gói GitHub
 
 - Các file RTL, `.bd`, `.xdc`, testbench được trích xuất nguyên bản từ `MicroBlaze_Controller(2).rar`.
